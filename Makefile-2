@@ -1,0 +1,143 @@
+# Makefile - E-Commerce Order Processing System (POSIX mqueue + semaphores)
+#
+#   make              build ./ecom_orders
+#   make run          run the full system (level 5, live dashboard)
+#   make test         quick smoke test of levels 1-5 and crash recovery
+#   make gtest        build and run the GoogleTest suite (tests.cpp)
+#   make coverage     gtest + gcov line/branch coverage report (+ HTML if lcov)
+#   make valgrind     memcheck: leaks, invalid reads/writes, fds (all processes)
+#   make helgrind     helgrind: data races / lock-order problems
+#   make cppcheck     static analysis
+#   make check        gtest + valgrind + helgrind + cppcheck
+#   make clean
+#
+# Tools (Ubuntu/WSL):
+#   sudo apt install build-essential libgtest-dev valgrind cppcheck lcov
+# If GoogleTest lives somewhere else:  make gtest GTEST_DIR=/path/to/install
+
+CC       ?= gcc
+CXX      ?= g++
+SRC      := ipc.c services.c workers.c supervisor.c
+HDR      := common.h
+BIN      := ecom_orders
+
+CFLAGS   := -std=gnu11 -Wall -Wextra -O2 -g -D_GNU_SOURCE
+LDLIBS   := -lrt -pthread
+
+# ---- GoogleTest (system package by default, or GTEST_DIR=prefix) ----
+GTEST_DIR ?=
+ifneq ($(GTEST_DIR),)
+  GT_INC := -I$(GTEST_DIR)/include
+  GT_LIB := -L$(GTEST_DIR)/lib
+endif
+GT_LIBS  := $(GT_LIB) -lgtest -lgtest_main -pthread
+
+# ---- instrumented build used by gtest / coverage (own directory) ----
+TDIR     := build/test
+TCFLAGS  := -std=gnu11 -Wall -Wextra -O0 -g -D_GNU_SOURCE -DCOVERAGE \
+            -Dmain=ecom_main --coverage
+TOBJ     := $(patsubst %.c,$(TDIR)/%.o,$(SRC))
+
+# ---- tool options ----
+VG_COMMON := --trace-children=yes --child-silent-after-fork=no \
+             --error-exitcode=99 --log-file=build/vg-%p.log
+SMOKE_ARGS := -l 2 -n 6 -Q          # small run: valgrind is ~20-50x slower
+
+.PHONY: all run test gtest coverage valgrind helgrind cppcheck check clean help
+
+all: $(BIN)
+
+$(BIN): $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
+
+help:
+	@sed -n '3,14p' Makefile
+
+run: $(BIN)
+	./$(BIN)
+
+test: $(BIN)
+	./$(BIN) -l 1 -n 10 -Q
+	./$(BIN) -l 2 -n 15 -Q
+	./$(BIN) -l 3 -n 15 -Q
+	./$(BIN) -l 4 -n 20 -Q
+	./$(BIN) -l 5 -n 20 -Q
+	./$(BIN) -l 5 -n 25 -x 12 -Q
+
+# ------------------------------------------------------------------ #
+# GoogleTest                                                          #
+# ------------------------------------------------------------------ #
+$(TDIR):
+	mkdir -p $(TDIR)
+
+$(TDIR)/%.o: %.c $(HDR) | $(TDIR)
+	$(CC) $(TCFLAGS) -c $< -o $@
+
+$(TDIR)/tests.o: tests.cpp $(HDR) | $(TDIR)
+	$(CXX) -std=c++17 -Wall -O0 -g -D_GNU_SOURCE -DCOVERAGE --coverage $(GT_INC) -c $< -o $@
+
+$(TDIR)/run_tests: $(TOBJ) $(TDIR)/tests.o
+	$(CXX) --coverage -o $@ $^ $(GT_LIBS) $(LDLIBS)
+
+gtest: $(TDIR)/run_tests
+	find $(TDIR) -name '*.gcda' -delete
+	./$(TDIR)/run_tests --gtest_color=yes
+
+# ------------------------------------------------------------------ #
+# Coverage                                                            #
+# ------------------------------------------------------------------ #
+coverage: gtest
+	@echo
+	@echo "=============== gcov: coverage per source file ==============="
+	@mkdir -p build/cov
+	cd build/cov && gcov -b -c -o ../test $(addprefix ../../,$(SRC)) 2>/dev/null \
+	  | grep -A4 "^File '[a-z_]*\.c'" | grep -vE "^--|Creating|^$$"
+	@if command -v lcov >/dev/null 2>&1 && command -v genhtml >/dev/null 2>&1; then \
+	  ( lcov -q -c -d $(TDIR) -o build/cov/all.info --rc branch_coverage=1 \
+	       --ignore-errors mismatch,inconsistent,unused 2>/dev/null && \
+	    lcov -q -r build/cov/all.info '/usr/*' '*tests.cpp' -o build/cov/app.info \
+	       --rc branch_coverage=1 --ignore-errors unused,inconsistent 2>/dev/null && \
+	    genhtml -q --branch-coverage -o build/cov/html build/cov/app.info \
+	       --ignore-errors inconsistent,corrupt,category 2>/dev/null && \
+	    echo "HTML report: build/cov/html/index.html" ) \
+	  || echo "(lcov HTML report could not be generated; gcov summary above is complete)"; \
+	else echo "(install lcov for an HTML report)"; fi
+
+# ------------------------------------------------------------------ #
+# Valgrind                                                            #
+# ------------------------------------------------------------------ #
+valgrind: $(BIN)
+	@mkdir -p build && rm -f build/*.log
+	valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+	  --track-origins=yes --track-fds=yes $(VG_COMMON) \
+	  ./$(BIN) $(SMOKE_ARGS)
+	@echo "---- memcheck summary (one line per process) ----"
+	@grep -h "ERROR SUMMARY" build/*.log | sort | uniq -c
+	@! grep -qhE "definitely lost: [1-9]|Invalid (read|write)|uninitialised" build/*.log \
+	  || { echo "memcheck found problems, see build/*.log"; exit 1; }
+	@echo "memcheck: clean"
+
+# ------------------------------------------------------------------ #
+# Helgrind                                                            #
+# ------------------------------------------------------------------ #
+helgrind: $(BIN)
+	@mkdir -p build && rm -f build/*.log
+	valgrind --tool=helgrind $(VG_COMMON) ./$(BIN) $(SMOKE_ARGS)
+	@echo "---- helgrind summary (one line per process) ----"
+	@grep -h "ERROR SUMMARY" build/*.log | sort | uniq -c
+	@echo "helgrind: done (details in build/*.log)"
+
+# ------------------------------------------------------------------ #
+# Cppcheck                                                            #
+# ------------------------------------------------------------------ #
+cppcheck:
+	cppcheck --enable=warning,style,performance,portability --inconclusive \
+	  --std=c11 --language=c --force --inline-suppr -D_GNU_SOURCE \
+	  --suppress=missingIncludeSystem --suppress=unusedStructMember \
+	  --error-exitcode=1 -q $(SRC) $(HDR)
+	@echo "cppcheck: no findings"
+
+check: gtest valgrind helgrind cppcheck
+
+clean:
+	rm -rf build $(BIN) *.log *.gcda *.gcno *.gcov
