@@ -1,0 +1,26 @@
+all:
+	gcc -std=gnu11 -Wall -Wextra -D_GNU_SOURCE -o ecom_orders ipc.c services.c workers.c supervisor.c -lrt -pthread
+
+run:
+	./ecom_orders
+
+valgrind:
+	valgrind --trace-children=yes --leak-check=full --show-leak-kinds=all --track-origins=yes --verbose ./ecom_orders -l 3 -p 2 -c 2 -n 4 -Q
+
+gtest:
+	gcc -std=gnu11 --coverage -D_GNU_SOURCE -DCOVERAGE -Dmain=ecom_main -c supervisor.c -o supervisor.o
+	gcc -std=gnu11 --coverage -D_GNU_SOURCE -DCOVERAGE -c ipc.c services.c workers.c
+	g++ -std=c++17 --coverage -D_GNU_SOURCE -DCOVERAGE -o gtest_runner tests.cpp supervisor.o ipc.o services.o workers.o -lgtest -lgtest_main -pthread -lrt
+	./gtest_runner
+
+coverage:
+	gcov -b -c ipc.c services.c workers.c supervisor.c
+
+cppcheck:
+	cppcheck --enable=all --inconclusive --std=c11 --language=c --suppress=missingIncludeSystem --suppress=staticFunction --suppress=normalCheckLevelMaxBranches --suppress=unmatchedSuppression --suppress=checkersReport *.c 2> cppcheck.txt
+
+misra:
+	cppcheck --platform=unix64 --addon=misra --enable=style --library=posix --std=c11 --language=c --suppress=missingIncludeSystem *.c 2> misra.txt
+
+clean:
+	rm -f ecom_orders gtest_runner *.o *.gcda *.gcno *.gcov *.log cppcheck.txt misra.txt
